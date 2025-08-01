@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 # global for error reporting
 ASDF_MAVEN_ERROR=""
 
@@ -8,18 +10,48 @@ install_maven() {
 	local version=$1
 	local destdir=$2
 
-	get_maven $version "$destdir"
-	[[ -z "$ASDF_MAVEN_ERROR" ]] || return
+	# Validate inputs
+	if [[ -z "$version" ]]; then
+		ASDF_MAVEN_ERROR="No Maven version specified"
+		return 1
+	fi
 
-	build_copy_cleanup $version "$destdir"
+	if [[ -z "$destdir" ]]; then
+		ASDF_MAVEN_ERROR="No destination directory specified"
+		return 1
+	fi
+
+	echo "Installing Maven version $version to $destdir"
+
+	# Download Maven
+	if ! get_maven "$version" "$destdir"; then
+		return 1
+	fi
+
+	# Extract and prepare files
+	if ! build_copy_cleanup "$version" "$destdir"; then
+		return 1
+	fi
+
+	echo "Maven $version installed successfully"
+	return 0
 }
 
 download_file() {
 	local url=$1
 	local dest=$2
 
-	curl -fLC - --retry 3 --retry-delay 3 -o "$dest" "$url"
-	return $?
+	# Create destination directory if it doesn't exist
+	mkdir -p "$(dirname "$dest")"
+
+	# Download with progress bar, follow redirects, and retry on failure
+	if curl -fLC - --retry 3 --retry-delay 3 --progress-bar -o "$dest" "$url"; then
+		return 0
+	else
+		# Clean up partial downloads
+		rm -f "$dest"
+		return 1
+	fi
 }
 
 # Download Maven source from Apache
@@ -27,29 +59,57 @@ get_maven() {
 	local version=$1
 	local destdir=$2
 
+	# Validate inputs
+	if [[ -z "$version" ]]; then
+		ASDF_MAVEN_ERROR="Maven version not specified"
+		return 1
+	fi
+
+	if [[ -z "$destdir" ]]; then
+		ASDF_MAVEN_ERROR="Destination directory not specified"
+		return 1
+	fi
+
 	local major
 	major=$(echo "$version" | cut -d '.' -f 1)
-	local main_url="https://dlcdn.apache.org/maven/maven-$major/$version/binaries/apache-maven-$version-bin.tar.gz"
-	local archive_url="https://archive.apache.org/dist/maven/maven-$major/$version/binaries/apache-maven-$version-bin.tar.gz"
+	
+	# Validate major version
+	if [[ ! "$major" =~ ^[0-9]+$ ]]; then
+		ASDF_MAVEN_ERROR="Invalid Maven version format: $version"
+		return 1
+	fi
+	local filename="apache-maven-$version-bin.tar.gz"
+	local main_url="https://dlcdn.apache.org/maven/maven-$major/$version/binaries/$filename"
+	local archive_url="https://archive.apache.org/dist/maven/maven-$major/$version/binaries/$filename"
 
 	if [[ "$version" == *SNAPSHOT ]]; then
+		echo "Downloading Maven SNAPSHOT version $version..."
 		local snapshot_url="https://repository.apache.org/service/local/artifact/maven/redirect?r=snapshots&g=org.apache.maven&a=apache-maven&v=$version&e=tar.gz&c=bin"
-		download_file "$snapshot_url" "$destdir/$version.tar.gz"
-		if [ $? -ne 0 ]; then
-			ASDF_MAVEN_ERROR="Could not download SNAPSHOT version $version from $snapshot_url. Perhaps the version of Maven you're trying to install does not exist"
+		if download_file "$snapshot_url" "$destdir/$version.tar.gz"; then
+			echo "Successfully downloaded Maven SNAPSHOT $version"
+			return 0
+		else
+			ASDF_MAVEN_ERROR="Could not download SNAPSHOT version $version. Perhaps the version does not exist or network issues occurred"
 			return 1
 		fi
-		return 0
 	fi
 
 	# Attempt to download from the main URL
-	if [ "$(download_file "$main_url" "$destdir/$version.tar.gz")" -ne 0 ]; then
-		# If the download fails, attempt to download from the archive URL
-		if [ "$(download_file "$archive_url" "$destdir/$version.tar.gz")" -ne 0 ]; then
-			ASDF_MAVEN_ERROR="Could not download Maven $version from either the main or archive URL. Perhaps the version of Maven you're trying to install does not exist"
-			return 1
-		fi
+	echo "Attempting to download Maven $version from main distribution site..."
+	if download_file "$main_url" "$destdir/$version.tar.gz"; then
+		echo "Successfully downloaded Maven $version from main URL"
+		return 0
 	fi
+
+	# If main URL fails, try archive URL
+	echo "Main URL failed, trying archive URL..."
+	if download_file "$archive_url" "$destdir/$version.tar.gz"; then
+		echo "Successfully downloaded Maven $version from archive URL"
+		return 0
+	fi
+
+	ASDF_MAVEN_ERROR="Could not download Maven $version from either the main or archive URL. Please check your network connection and verify the version exists"
+	return 1
 }
 
 # Build Maven, copy files and cleanup.
@@ -57,24 +117,87 @@ build_copy_cleanup() {
 	local version=$1
 	local destdir=$2
 
-	local origin=$(pwd)
-	cd "$destdir"; {
-		tar xzvf $version.tar.gz
-		rm $version.tar.gz
+	# Validate inputs
+	if [[ -z "$version" ]] || [[ -z "$destdir" ]]; then
+		ASDF_MAVEN_ERROR="Invalid parameters for build_copy_cleanup"
+		return 1
+	fi
 
-		mv apache-maven-$version/* .
-		rmdir apache-maven-$version
+	local archive_file="$destdir/$version.tar.gz"
+	
+	# Check if archive exists
+	if [[ ! -f "$archive_file" ]]; then
+		ASDF_MAVEN_ERROR="Archive file not found: $archive_file"
+		return 1
+	fi
+
+	echo "Extracting Maven $version..."
+	local origin=$(pwd)
+	
+	# Use a trap to ensure we return to original directory
+	trap "cd '$origin'" EXIT
+	
+	cd "$destdir" || {
+		ASDF_MAVEN_ERROR="Failed to change to destination directory: $destdir"
+		return 1
 	}
-	cd "$origin"
+
+	# Extract archive
+	if ! tar xzf "$version.tar.gz"; then
+		ASDF_MAVEN_ERROR="Failed to extract Maven archive"
+		return 1
+	fi
+
+	# Clean up archive
+	rm -f "$version.tar.gz"
+
+	# Move files from extracted directory
+	if [[ -d "apache-maven-$version" ]]; then
+		# Use mv with proper error handling
+		if ! mv "apache-maven-$version"/* . 2>/dev/null; then
+			# If mv fails, try cp as fallback
+			cp -r "apache-maven-$version"/* . && rm -rf "apache-maven-$version"
+		else
+			rmdir "apache-maven-$version"
+		fi
+	fi
+
+	echo "Maven $version installation files prepared successfully"
+	return 0
 }
 
 #
 # MAIN
 #
-install_maven $ASDF_INSTALL_VERSION "$ASDF_INSTALL_PATH"
 
-if [ -n "$ASDF_MAVEN_ERROR" ]; then
-	echo "ERROR: $ASDF_MAVEN_ERROR." > /dev/stderr
+# Disable exit on error for main execution to handle errors gracefully
+set +e
+
+# Validate required environment variables
+if [[ -z "$ASDF_INSTALL_VERSION" ]]; then
+	echo "ERROR: ASDF_INSTALL_VERSION is not set" >&2
+	exit 1
+fi
+
+if [[ -z "$ASDF_INSTALL_PATH" ]]; then
+	echo "ERROR: ASDF_INSTALL_PATH is not set" >&2
+	exit 1
+fi
+
+# Run the installation
+install_maven "$ASDF_INSTALL_VERSION" "$ASDF_INSTALL_PATH"
+install_result=$?
+
+# Check for errors
+if [[ $install_result -ne 0 ]] || [[ -n "$ASDF_MAVEN_ERROR" ]]; then
+	if [[ -n "$ASDF_MAVEN_ERROR" ]]; then
+		echo "ERROR: $ASDF_MAVEN_ERROR" >&2
+	else
+		echo "ERROR: Maven installation failed" >&2
+	fi
 	unset ASDF_MAVEN_ERROR
 	exit 1
 fi
+
+unset ASDF_MAVEN_ERROR
+exit 0
